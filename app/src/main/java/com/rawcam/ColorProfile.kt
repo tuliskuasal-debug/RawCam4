@@ -1,6 +1,7 @@
 package com.rawcam
 
 import android.hardware.camera2.params.TonemapCurve
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.*
 
@@ -65,6 +66,12 @@ class ColorProfile {
         }
         return TonemapCurve(r, g, b)
     }
+
+    fun save(): String = JSONObject().apply {
+        put("contrast", contrast.toDouble()); put("saturation", saturation.toDouble())
+        put("tint", tint.toDouble()); put("sharpness", sharpness.toDouble())
+        put("curve", JSONArray().apply { pts.forEach { put(JSONArray().put(it[0].toDouble()).put(it[1].toDouble())) } })
+    }.toString(2)
 
     /** Format JSON: {"contrast":1,"saturation":1,"tint":0,"sharpness":0,"curve":[[0,0],[0.5,0.55],[1,1]]} */
     fun load(json: String) {

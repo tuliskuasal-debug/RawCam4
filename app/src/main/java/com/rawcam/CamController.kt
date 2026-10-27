@@ -39,7 +39,7 @@ class CamController(private val act: Activity, private val tv: AutoFitTextureVie
     // ---- setting yang diubah UI ----
     var video = false; var soo = false; var openGate = false; var ois = true
     var photoOut = "JPG"                       // JPG | RAW | RAW+JPG
-    var auto = true; var iso = 100; var shutter = 1.0 / 125; var focus = 0f; var aperture = 0f; var kelvin = 5500
+    var auto = true; var ev = 0f; var iso = 100; var shutter = 1.0 / 125; var focus = 0f; var aperture = 0f; var kelvin = 5500
     var size = Size(4000, 3000); var fpsValue = 30
     val profile = ColorProfile()
     var recording = false
@@ -64,6 +64,7 @@ class CamController(private val act: Activity, private val tv: AutoFitTextureVie
     private var recUri: Uri? = null
     private var recPfd: android.os.ParcelFileDescriptor? = null
     private var lastCct: ColorSpaceTransform? = null
+    private var lastGains: RggbChannelVector? = null
     private var rawImg: Image? = null
     private var rawRes: TotalCaptureResult? = null
     private var shotName = ""
@@ -189,11 +190,9 @@ class CamController(private val act: Activity, private val tv: AutoFitTextureVie
             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
             b.set(CaptureRequest.CONTROL_AF_MODE, if (video) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            if (soo) { // -1 EV: lindungi highlight, shadow diangkat oleh kurva log
-                val step = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)!!.toFloat()
-                val r = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)!!
-                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, (-1f / step).roundToInt().coerceIn(r.lower, r.upper))
-            }
+            val step = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)!!.toFloat()
+            val r = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)!!
+            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, (ev / step).roundToInt().coerceIn(r.lower, r.upper))
         } else {
             val er = ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)!!
             var ns = (shutter * 1e9).toLong().coerceIn(er.lower, er.upper)
@@ -206,8 +205,8 @@ class CamController(private val act: Activity, private val tv: AutoFitTextureVie
             if (aperture > 0f) b.set(CaptureRequest.LENS_APERTURE, aperture)
             b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
             b.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, kelvinGains(kelvin))
-            b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, lastCct ?: ColorSpaceTransform(intArrayOf(1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1)))
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, manualGains(kelvin) ?: lastGains ?: RggbChannelVector(2f, 1f, 1f, 1.6f))
+            b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, lastCct ?: fallbackCct(kelvin))
         }
         if (soo) { // bypass pemrosesan ISP semaksimal yang diizinkan HAL
             if (has(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES, 0)) b.set(CaptureRequest.NOISE_REDUCTION_MODE, 0)
@@ -224,18 +223,55 @@ class CamController(private val act: Activity, private val tv: AutoFitTextureVie
         }
     }
 
-    private fun kelvinGains(k: Int): RggbChannelVector {
-        val t = k / 100.0
-        val r = if (t <= 66) 255.0 else 329.698727446 * (t - 60).pow(-0.1332047592)
-        val g = if (t <= 66) 99.4708025861 * ln(t) - 161.1195681661 else 288.1221695283 * (t - 60).pow(-0.0755148492)
-        val b = if (t >= 66) 255.0 else if (t <= 19) 0.0 else 138.5177312231 * ln(t - 10) - 305.0447927307
-        val rr = r.coerceIn(1.0, 255.0); val gg = g.coerceIn(1.0, 255.0); val bb = b.coerceIn(1.0, 255.0)
-        return RggbChannelVector((gg / rr).toFloat(), 1f, 1f, (gg / bb).toFloat())
+    // ---- WB manual berbasis matriks kalibrasi sensor (cara DNG) ----
+    private fun m3(t: ColorSpaceTransform?): DoubleArray? =
+        t?.let { x -> DoubleArray(9) { x.getElement(it % 3, it / 3).toDouble() } }
+    private fun illK(i: Int?) = when (i) {
+        17 -> 2856.0; 18 -> 4874.0; 19 -> 6774.0; 20 -> 5503.0; 21 -> 6504.0; 22 -> 7504.0; 23 -> 5003.0
+        1, 4, 9 -> 5500.0; 2 -> 4200.0; 3 -> 2856.0; 10 -> 6500.0; 11 -> 7500.0; 24 -> 3200.0; else -> 6504.0
     }
+    private fun interp(a: ColorSpaceTransform?, b: ColorSpaceTransform?, k: Double): DoubleArray? {
+        val m1 = m3(a); val m2 = m3(b)
+        if (m1 == null) return m2; if (m2 == null) return m1
+        val k1 = illK(ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1))
+        val k2 = illK(ch.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt())
+        val w = if (k1 == k2) 0.0 else ((1 / k - 1 / k1) / (1 / k2 - 1 / k1)).coerceIn(0.0, 1.0)
+        return DoubleArray(9) { m1[it] * (1 - w) + m2[it] * w }
+    }
+    private fun kelvinXyz(k: Double): DoubleArray {
+        val t = k.coerceIn(1700.0, 25000.0)
+        val x = if (t <= 4000) -0.2661239e9 / t.pow(3) - 0.2343589e6 / t.pow(2) + 0.8776956e3 / t + 0.179910
+                else -3.0258469e9 / t.pow(3) + 2.1070379e6 / t.pow(2) + 0.2226347e3 / t + 0.240390
+        val y = when {
+            t <= 2222 -> -1.1063814 * x.pow(3) - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+            t <= 4000 -> -0.9549476 * x.pow(3) - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+            else -> 3.0817580 * x.pow(3) - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
+        }
+        return doubleArrayOf(x / y, 1.0, (1 - x - y) / y)
+    }
+    private fun manualGains(k: Int): RggbChannelVector? {
+        val cm = interp(ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1), ch.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2), k.toDouble()) ?: return null
+        val xyz = kelvinXyz(k.toDouble())
+        val n = DoubleArray(3) { i -> cm[i * 3] * xyz[0] + cm[i * 3 + 1] * xyz[1] + cm[i * 3 + 2] * xyz[2] }
+        if (n.any { it <= 1e-6 }) return null
+        return RggbChannelVector((n[1] / n[0]).toFloat(), 1f, 1f, (n[1] / n[2]).toFloat())
+    }
+    private fun fallbackCct(k: Int): ColorSpaceTransform {
+        val fm = interp(ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1), ch.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2), k.toDouble())
+        val r = if (fm == null) doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0) else {
+            val x2s = doubleArrayOf(3.1338561, -1.6168667, -0.4906146, -0.9787684, 1.9161415, 0.0334540, 0.0719453, -0.2289914, 1.4052427)
+            DoubleArray(9) { val i = it / 3; val j = it % 3; (0..2).sumOf { c -> x2s[i * 3 + c] * fm[c * 3 + j] } }
+        }
+        return ColorSpaceTransform(IntArray(18) { if (it % 2 == 0) (r[it / 2] * 10000).roundToInt() else 10000 })
+    }
+    fun evStep() = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)!!.toFloat()
 
     private val previewCb = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
-            if (auto) res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastCct = it }
+            if (auto) {
+                res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastCct = it }
+                res.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { lastGains = it }
+            }
         }
     }
 

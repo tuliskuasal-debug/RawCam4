@@ -19,6 +19,7 @@ class MainActivity : Activity() {
     private lateinit var outSp: Spinner
     private lateinit var profBox: LinearLayout
     private lateinit var manBox: LinearLayout
+    private lateinit var evBox: LinearLayout
     private lateinit var shutterBtn: Button
     private var sizes = listOf<android.util.Size>()
     private var fpsList = listOf<Int>()
@@ -66,6 +67,7 @@ class MainActivity : Activity() {
         val modeSp = spin(listOf("Foto", "Video"), 0) { cam.video = it == 1; outSp.visibility = if (cam.video) View.GONE else View.VISIBLE
             shutterBtn.text = if (cam.video) "● REC" else "◉"; refreshLists(); cam.restart() }
         val typeSp = spin(listOf("Default kamera", "SOOC / SOOS (bypass)"), 0) { cam.soo = it == 1
+            cam.ev = if (cam.soo) -1f else 0f; (evBox.getChildAt(1) as SeekBar).progress = (50 + cam.ev / 3f * 50).toInt()
             profBox.visibility = if (cam.soo) View.VISIBLE else View.GONE; cam.restart() }
         outSp = spin(listOf("JPG", "RAW", "RAW + JPG"), 0) { cam.photoOut = listOf("JPG", "RAW", "RAW+JPG")[it]; cam.restart() }
         resSp = spin(listOf(), 0) { if (it < sizes.size) { cam.size = sizes[it]; cam.restart() } }
@@ -90,12 +92,14 @@ class MainActivity : Activity() {
         manBox.addView(seek("WB", 53, { "${2500 + it * 65}K" }) { cam.kelvin = 2500 + it * 65; cam.updateRepeating() })
         val ap = cam.apertures()
         if (ap.size > 1) manBox.addView(spin(ap.map { "f/$it" }, 0) { cam.aperture = ap[it]; cam.updateRepeating() })
-        val auto = sw("Auto exposure & WB", true) { cam.auto = it; manBox.visibility = if (it) View.GONE else View.VISIBLE; cam.updateRepeating() }
+        evBox = seek("Target exposure", 50, { "%+.1f EV".format((it - 50) / 50.0 * 3) }) { cam.ev = (it - 50) / 50f * 3f; cam.updateRepeating() }
+        val auto = sw("Auto exposure & WB", true) { cam.auto = it; manBox.visibility = if (it) View.GONE else View.VISIBLE
+            evBox.visibility = if (it) View.VISIBLE else View.GONE; cam.updateRepeating() }
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(4), dp(12), dp(4))
             addView(row(modeSp, typeSp)); addView(outSp); addView(row(resSp, fpsSp))
-            addView(gate); addView(ois); addView(auto); addView(manBox); addView(profBox)
+            addView(gate); addView(ois); addView(auto); addView(evBox); addView(manBox); addView(profBox)
         }
         shutterBtn = Button(this).apply { text = "◉"; textSize = 24f
             setOnClickListener { if (cam.video) cam.toggleRecord() else cam.shoot() } }
@@ -128,6 +132,9 @@ class MainActivity : Activity() {
         ll.addView(Button(this).apply { text = "Reset kurva (linear)"; setOnClickListener { p.resetCurve(); cv.invalidate(); cam.updateRepeating() } })
         ll.addView(Button(this).apply { text = "Load profil (JSON)"; setOnClickListener {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, 77) } })
+        ll.addView(Button(this).apply { text = "Simpan profil (JSON)"; setOnClickListener {
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "application/json"
+                putExtra(Intent.EXTRA_TITLE, "profil_warna.json") }, 78) } })
         ll.addView(seek("Contrast", ((p.contrast - 0.5f) * 100).toInt(), { "%.2f".format(0.5 + it / 100.0) }) { p.contrast = 0.5f + it / 100f; cam.updateRepeating() })
         ll.addView(seek("Saturasi", (p.saturation * 50).toInt(), { "%.2f".format(it / 50.0) }) { p.saturation = it / 50f; cam.updateRepeating() })
         ll.addView(seek("Tint (hijau–magenta)", ((p.tint + 1) * 50).toInt(), { "%.2f".format((it - 50) / 50.0) }) { p.tint = (it - 50) / 50f; cam.updateRepeating() })
@@ -136,6 +143,11 @@ class MainActivity : Activity() {
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        if (req == 78 && res == RESULT_OK && data?.data != null) {
+            try { contentResolver.openOutputStream(data.data!!)!!.use { it.write(cam.profile.save().toByteArray()) }
+                Toast.makeText(this, "Profil tersimpan", Toast.LENGTH_SHORT).show() }
+            catch (e: Exception) { Toast.makeText(this, "Gagal simpan: ${e.message}", Toast.LENGTH_LONG).show() }
+        }
         if (req == 77 && res == RESULT_OK && data?.data != null) {
             try { cam.profile.load(contentResolver.openInputStream(data.data!!)!!.bufferedReader().readText()); cam.updateRepeating(); showEditor() }
             catch (e: Exception) { Toast.makeText(this, "Profil tidak valid: ${e.message}", Toast.LENGTH_LONG).show() }
